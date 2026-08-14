@@ -74,18 +74,44 @@ public class JdbcSourceSplitEnumerator
 
         Set<Integer> readers = context.registeredReaders();
         while (!pendingTables.isEmpty()) {
+            TablePath tablePath;
             synchronized (stateLock) {
-                TablePath tablePath = pendingTables.poll();
-                LOG.info("Splitting table {}.", tablePath);
-
-                Collection<JdbcSourceSplit> splits = splitter.generateSplits(tables.get(tablePath));
-                LOG.info("Split table {} into {} splits.", tablePath, splits.size());
-
-                addPendingSplit(splits);
+                tablePath = pendingTables.poll();
             }
+            if (tablePath == null) {
+                break;
+            }
+            LOG.info("Splitting table {}.", tablePath);
 
-            synchronized (stateLock) {
-                assignSplit(readers);
+            JdbcSourceTable table = tables.get(tablePath);
+            // open() performs DB round trips (MIN/MAX) - run outside the lock so a concurrent
+            // snapshotState()/checkpoint is never blocked by split analysis.
+            splitter.open(table);
+            if (splitter.hasMoreSplits()) {
+                // Streaming path: generate and assign one split at a time. Each DB round trip
+                // (queryNextChunkMaxComposite) happens outside the lock; the lock only guards the
+                // in-memory enqueue/assign (microseconds), so checkpoints stay responsive and the
+                // enumerator holds at most one split per reader at a time (bounded memory).
+                int splitCount = 0;
+                while (splitter.hasMoreSplits()) {
+                    JdbcSourceSplit split = splitter.generateNextSplit();
+                    if (split == null) {
+                        break;
+                    }
+                    splitCount++;
+                    synchronized (stateLock) {
+                        addPendingSplit(Collections.singletonList(split));
+                        assignSplit(readers);
+                    }
+                }
+                LOG.info("Streamed table {} into {} splits.", tablePath, splitCount);
+            } else {
+                Collection<JdbcSourceSplit> splits = splitter.generateSplits(table);
+                LOG.info("Split table {} into {} splits.", tablePath, splits.size());
+                synchronized (stateLock) {
+                    addPendingSplit(splits);
+                    assignSplit(readers);
+                }
             }
         }
 
