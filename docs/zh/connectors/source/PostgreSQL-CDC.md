@@ -22,6 +22,9 @@ import ChangeLog from '../changelog/connector-cdc-postgres.md';
 
 PostgreSQL CDC 连接器允许从 PostgreSQL 数据库读取快照数据和增量数据。本文档介绍如何配置 PostgreSQL CDC 连接器。
 
+部分 PostgreSQL 兼容数据库（例如 HighGo）在 `information_schema.tables` 中会对同一张物理表返回多行重复记录。
+连接器在表发现阶段会按完整的 `catalog.schema.table` 标识去重，这些重复行会被忽略，任务可正常启动。
+
 ## 支持的数据源信息
 
 | 数据源      |                     支持的版本                      |        驱动        |                  Url                  |                                  Maven                                   |
@@ -114,6 +117,9 @@ ALTER TABLE your_table_name REPLICA IDENTITY FULL;
 | exactly_once                              | Boolean  | 否   | false    | 在快照阶段启用精确一次语义。仅当 `startup.mode` 为 `initial` 或 `snapshot-only` 时可用。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | format                                    | Enum     | 否   | DEFAULT  | PostgreSQL CDC 的可选输出格式，有效枚举为 `DEFAULT`、`COMPATIBLE_DEBEZIUM_JSON`。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | require-replica-identity-full             | Boolean  | 否   | true     | 要求表具有 REPLICA IDENTITY FULL。设置为 false 时，允许表使用其他副本标识设置，但 UPDATE/DELETE 事件可能不包含之前的状态。此选项仅应用于仅追加的表（例如 outbox 模式）。默认为 true 以保持向后兼容性。                                                                                                                                                                                                                                                                                                             |
+| schema-changes.enabled                    | Boolean  | 否   | false    | 启用 Schema 演进事件。PostgreSQL CDC 当前仅支持 `ADD COLUMN`，并且要求 `decoding.plugin.name = "pgoutput"`。PostgreSQL 发送下一条 RELATION 消息时才能感知该变更，通常发生在该表 DDL 后的第一条行变更之前。 |
+| schema-changes.include                    | List     | 否   | -        | Schema 演进启用后，仅向下游发送列出的事件类型。当前支持的操作请使用 `add.column`（或分组别名 `update.columns`）。为空表示允许全部受支持的类型。 |
+| schema-changes.exclude                    | List     | 否   | -        | 不向下游发送列出的 Schema change 事件类型。先应用 include，再应用 exclude；同一类型同时出现时 exclude 优先。 |
 | debezium                                  | Config   | 否   | -        | 将 [Debezium 的属性](https://github.com/debezium/debezium/blob/v1.9.8.Final/documentation/modules/ROOT/pages/connectors/postgresql.adoc#connector-configuration-properties) 传递给用于捕获 PostgreSQL 服务器数据更改的 Debezium 嵌入式引擎。                                                                                                                                                                                                                                                                                                                                |
 | common-options                            |          | 否   | -        | 源插件的公共参数，请参阅 [源公共选项](../common-options/source-common-options.md) 获取详细信息。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
@@ -166,6 +172,27 @@ sink {
     schema = "inventory"
     tablePrefix = "sink_"
     primary_keys = ["id"]
+  }
+}
+```
+
+### ADD COLUMN Schema 演进
+
+PostgreSQL 不会把原始 `ALTER TABLE` SQL 文本写入逻辑复制流。使用 `pgoutput` 时，SeaTunnel 会从
+RELATION 消息中检测变化后的表结构，在后续行事件之前发出 `ADD COLUMN` 事件，并更新下游表结构。
+因此，执行 DDL 后该表必须再发生一条行变更，连接器才能感知 Schema 变化。
+
+如果 RELATION 消息包含 `ADD COLUMN` 之外的行 Schema 变更，作业会在处理新 Schema 的数据行之前
+失败。恢复同一 Checkpoint 时仍会再次遇到该变更；只有升级到支持该变更的连接器，或完成受控的
+Schema 迁移并重新启动作业后，才能继续处理。
+
+```hocon
+source {
+  Postgres-CDC {
+    # ...
+    decoding.plugin.name = "pgoutput"
+    schema-changes.enabled = true
+    schema-changes.include = ["add.column"]
   }
 }
 ```
@@ -348,6 +375,12 @@ SeaTunnel 在任务启动时会创建或复用 `slot.name` 指定的复制槽。
 `committed-offset` 时，复制槽必须已存在，因为 SeaTunnel 会使用其 `confirmed_flush_lsn`
 作为启动偏移量。未使用的复制槽会持续占用磁盘上的 WAL 段，导致 WAL 持续增长。当 CDC
 任务永久下线时，应在 PostgreSQL 侧手动删除不再使用的复制槽。
+
+### 从保存点恢复时如何处理事务边界？
+
+恢复时会区分保存的事务提交记录与已处理的数据行，因为事务提交和下一事务的第一条数据行
+可能具有相同的 LSN。任务停止期间提交的数据仍可被重放。不包含操作类型的旧保存点仍可读取；
+为避免丢失数据，恢复时可能重放无法明确区分的边界记录。
 
 ### PostgreSQL CDC 为什么会滞后？
 
